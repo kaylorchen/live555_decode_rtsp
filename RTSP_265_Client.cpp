@@ -47,6 +47,8 @@ SDL_Renderer *sdlRenderer;
 SDL_Texture *sdlTexture;
 SDL_Rect sdlRect;
 bool SDLInit = false;
+AVFrame *pFrameYUV;
+struct SwsContext *img_convert_ctx =NULL;
 
 // Forward function definitions:
 void decode_init(void);
@@ -643,6 +645,7 @@ void decode_init(void)
       fprintf(stderr,"Could not allocate video frame\n");
       exit(1);
   }
+  pFrameYUV =av_frame_alloc();
 }
 
 int decoderyuv(unsigned char * inbuf, int read_size)
@@ -667,8 +670,28 @@ int decoderyuv(unsigned char * inbuf, int read_size)
        if(!SDLInit)
        {
          sdl_init(frame->width, frame->height) ;
+        // sdl_init(100, 100);
          SDLInit = true;
        }
+       printf("c->width = %d, c->height = %d, c->pix_fmt = %d\n", c->width, c->height, c->pix_fmt);
+      enum AVPixelFormat FMT = AV_PIX_FMT_NV12;
+      uint8_t *yuv = (uint8_t *) av_malloc(avpicture_get_size(FMT, frame->width,frame->height)* sizeof(uint8_t));
+      avpicture_fill((AVPicture *)pFrameYUV, yuv, FMT, frame->width, frame->height);
+      img_convert_ctx = sws_getContext(c->width, c->height, c->pix_fmt, c->width, c->height, FMT, 2, NULL, NULL, NULL);
+      sws_scale(img_convert_ctx, (const uint8_t* const*) frame->data,  frame->linesize, 0, frame->height, pFrameYUV->data,pFrameYUV->linesize);
+      SDL_UpdateTexture(sdlTexture, NULL, yuv, c->width);
+
+      sdlRect.x = 0;
+      sdlRect.y = 0;
+      sdlRect.w = c->width;
+      sdlRect.h = c->height;
+
+      SDL_RenderClear(sdlRenderer);
+      SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, &sdlRect);
+      SDL_RenderPresent(sdlRenderer);
+
+      av_free(yuv);
+                        // SDL_Delay(33);
     }
     free(buf);
 }
