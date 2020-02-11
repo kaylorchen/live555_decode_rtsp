@@ -23,10 +23,36 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 #include "liveMedia.hh"
 #include "BasicUsageEnvironment.hh"
+#include "iostream"
+#include <SDL_rect.h>
+#include <SDL_render.h>
+#include <SDL.h>
 
+extern "C"
+{
+#include "libavformat/avformat.h"
+#include "libswscale/swscale.h"
+#include "linux/videodev2.h"
+#include "sys/mman.h"
+}
+
+AVCodec *codec;
+AVCodecContext *c = NULL;
+AVFrame *frame;
+AVCodecParserContext *avParserContext;
+bool fHaveWrittenFirstFrame = false;
+
+SDL_Window *sdlWindow;
+SDL_Renderer *sdlRenderer;
+SDL_Texture *sdlTexture;
+SDL_Rect sdlRect;
+bool SDLInit = false;
 
 // Forward function definitions:
-
+void decode_init(void);
+void sdl_init(unsigned int width, unsigned int height);
+int decoderyuv(unsigned char * inbuf, int read_size);
+// int decoderyuv(unsigned char * inbuf, int read_size)
 // RTSP 'response handlers':
 void continueAfterDESCRIBE(RTSPClient* rtspClient, int resultCode, char* resultString);
 void continueAfterSETUP(RTSPClient* rtspClient, int resultCode, char* resultString);
@@ -71,15 +97,18 @@ int main(int argc, char** argv) {
   UsageEnvironment* env = BasicUsageEnvironment::createNew(*scheduler);
 
   // We need at least one "rtsp://" URL argument:
-  if (argc < 2) {
-    usage(*env, argv[0]);
-    return 1;
-  }
+  // if (argc < 2) {
+  //   usage(*env, argv[0]);
+  //   return 1;
+  // }
 
-  // There are argc-1 URLs: argv[1] through argv[argc-1].  Open and start streaming each one:
-  for (int i = 1; i <= argc-1; ++i) {
-    openURL(*env, argv[0], argv[i]);
-  }
+  // // There are argc-1 URLs: argv[1] through argv[argc-1].  Open and start streaming each one:
+  // for (int i = 1; i <= argc-1; ++i) {
+  //   openURL(*env, argv[0], argv[i]);
+  // }
+  openURL(*env, argv[0],"rtsp://192.168.1.10:554/test.264");
+
+  decode_init();
 
   // All subsequent activity takes place within the event loop:
   env->taskScheduler().doEventLoop(&eventLoopWatchVariable);
@@ -488,7 +517,9 @@ DummySink::DummySink(UsageEnvironment& env, MediaSubsession& subsession, char co
   : MediaSink(env),
     fSubsession(subsession) {
   fStreamId = strDup(streamId);
-  fReceiveBuffer = new u_int8_t[DUMMY_SINK_RECEIVE_BUFFER_SIZE];
+  fReceiveBuffer = new u_int8_t[DUMMY_SINK_RECEIVE_BUFFER_SIZE + 4];
+  char head[4] = {0x00, 0x00, 0x00, 0x01};
+  memcpy(fReceiveBuffer, head, 4);
 }
 
 DummySink::~DummySink() {
@@ -499,11 +530,16 @@ DummySink::~DummySink() {
 void DummySink::afterGettingFrame(void* clientData, unsigned frameSize, unsigned numTruncatedBytes,
 				  struct timeval presentationTime, unsigned durationInMicroseconds) {
   DummySink* sink = (DummySink*)clientData;
+  unsigned int SPropRecords = -1;
+  SPropRecord *p_record = parseSPropParameterSets(sink->fSubsession.fmtp_spropparametersets(), SPropRecords);
+      //sps pps 以数组的形式保存SPropRecord中
+  SPropRecord &sps = p_record[0];
+  SPropRecord &pps = p_record[1];
   sink->afterGettingFrame(frameSize, numTruncatedBytes, presentationTime, durationInMicroseconds);
 }
 
 // If you don't want to see debugging output for each received frame, then comment out the following line:
-#define DEBUG_PRINT_EACH_RECEIVED_FRAME 1
+// #define DEBUG_PRINT_EACH_RECEIVED_FRAME 1
 
 void DummySink::afterGettingFrame(unsigned frameSize, unsigned numTruncatedBytes,
 				  struct timeval presentationTime, unsigned /*durationInMicroseconds*/) {
@@ -523,6 +559,38 @@ void DummySink::afterGettingFrame(unsigned frameSize, unsigned numTruncatedBytes
 #endif
   envir() << "\n";
 #endif
+    unsigned char const start_code[4] = {0x00, 0x00, 0x00, 0x01};
+    static unsigned char* tmp = NULL;
+
+  if (!fHaveWrittenFirstFrame) {
+    unsigned numSPropRecords;
+    SPropRecord* sPropRecords	= parseSPropParameterSets(fSubsession.fmtp_spropparametersets(), numSPropRecords);
+    envir() << "numSPropRecords = " << numSPropRecords << "\n"; 
+    unsigned int totalsize = 0;
+    for (unsigned i = 0; i < numSPropRecords; ++i)
+    {
+      totalsize = totalsize + 4 + sPropRecords[i].sPropLength;
+    }
+    envir() << "totalsize = " << totalsize << "\n";
+    tmp = (unsigned char*)realloc(tmp, totalsize);
+    c->extradata_size = totalsize;
+    c->extradata = tmp;
+    for (unsigned i = 0; i < numSPropRecords; ++i) {
+	    memcpy(tmp, start_code, 4);
+	    memcpy(tmp + 4, sPropRecords[i].sPropBytes, sPropRecords[i].sPropLength);
+      tmp = tmp + 4 + sPropRecords[i].sPropLength;
+      printf("sPropRecords[%d].sPropLength = %d\n", i, sPropRecords[i].sPropLength);
+    }
+    delete[] sPropRecords;
+    fHaveWrittenFirstFrame = True; // for next time
+  }
+  for (size_t i = 0; i < 22; i++)
+  {
+    printf("%0.2X ", *(c->extradata + i));
+  }
+  printf("\n");  
+  decoderyuv(fReceiveBuffer, frameSize);
+
   
   // Then continue, to request the next frame of data:
   continuePlaying();
@@ -532,8 +600,104 @@ Boolean DummySink::continuePlaying() {
   if (fSource == NULL) return False; // sanity check (should not happen)
 
   // Request the next frame of data from our input source.  "afterGettingFrame()" will get called later, when it arrives:
-  fSource->getNextFrame(fReceiveBuffer, DUMMY_SINK_RECEIVE_BUFFER_SIZE,
+  fSource->getNextFrame(fReceiveBuffer + 4, DUMMY_SINK_RECEIVE_BUFFER_SIZE,
                         afterGettingFrame, this,
                         onSourceClosure, this);
   return True;
+}
+
+
+void decode_init(void)
+{
+  avcodec_register_all();
+  codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+  if( NULL == codec )
+  {
+      fprintf(stderr,"Codec not found\n");
+      exit(1);
+  }
+
+  c = avcodec_alloc_context3(codec);
+  if(NULL == c)
+  {
+      fprintf(stderr,"Could not allocate video codec context\n");
+      exit(1);
+  }
+
+  avParserContext = av_parser_init(AV_CODEC_ID_H264);
+  if( NULL == avParserContext)
+  {
+      fprintf(stderr,"Could not init avParserContext\n");
+      exit(1);
+  }
+
+  if(avcodec_open2(c,codec, NULL) < 0)
+  {
+      fprintf(stderr,"Could not open codec\n");
+      exit(1);
+  }
+
+  frame = av_frame_alloc();
+  if(NULL == frame)
+  {
+      fprintf(stderr,"Could not allocate video frame\n");
+      exit(1);
+  }
+}
+
+int decoderyuv(unsigned char * inbuf, int read_size)
+{
+  int got_frame;
+  unsigned char *buf = (unsigned char*)malloc((read_size + c->extradata_size)*2);
+  printf("read_size = %d, extradata_size = %d , total size = %d\n", read_size, c->extradata_size, read_size + c->extradata_size);
+  memcpy(buf, c->extradata, c->extradata_size);
+  memcpy(buf + c->extradata_size, inbuf, read_size);
+  AVPacket avpkt = {0};
+  av_init_packet(&avpkt);
+  avpkt.data = buf;
+  avpkt.size = read_size + c->extradata_size;
+  int decode_len = avcodec_decode_video2(c,frame, &got_frame, &avpkt);
+  std::cout << "decode_len = " <<decode_len << std::endl;
+  // exit(1);
+  if(decode_len < 0)
+    fprintf(stderr,"Error while decoding frame \n");
+  if(got_frame)
+    {
+       std::cout << "width = " << frame->width << ", height = " << frame->height << std::endl;
+       if(!SDLInit)
+       {
+         sdl_init(frame->width, frame->height) ;
+         SDLInit = true;
+       }
+    }
+    free(buf);
+}
+
+void sdl_init(unsigned int width, unsigned int height)
+{
+  if (SDL_Init(SDL_INIT_VIDEO))
+    {
+        printf("Could not initialize SDL - %s\n", SDL_GetError());
+        exit(1);
+    }
+    sdlWindow = SDL_CreateWindow("Simplest Video Play SDL2", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                                 width, height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (sdlWindow == 0)
+    {
+        printf("SDL: could not create SDL_Window - exiting:%s\n", SDL_GetError());
+         exit(1);
+    }
+
+    sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, SDL_RENDERER_ACCELERATED);
+    if (sdlRenderer == NULL)
+    {
+        printf("SDL: could not create SDL_Renderer - exiting:%s\n", SDL_GetError());
+         exit(1);
+    }
+    sdlTexture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_NV12, SDL_TEXTUREACCESS_STREAMING, width, height);
+    if (sdlTexture == NULL)
+    {
+        printf("SDL: could not create SDL_Texture - exiting:%s\n", SDL_GetError());
+         exit(1);
+    }
 }
